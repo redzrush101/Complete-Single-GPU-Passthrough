@@ -1,61 +1,53 @@
-**Note**: I'm currently not using this, so my ability to provide support is limited. If you encounter issues or have questions about the setup, I recommend asking at [r/VFIO](https://reddit.com/r/vfio).
+# VFIO Single GPU Passthrough Guide (Updated Sep 2025)
 
-## **Table Of Contents**
+**Note**: Limited support. Ask at [r/VFIO](https://reddit.com/r/vfio).
+
+## Table Of Contents
 * **[IOMMU Setup](#enable--verify-iommu)**
+* **[Resizable BAR](#resizable-bar)**
 * **[Installing Packages](#install-required-tools)**
 * **[Enabling Services](#enable-required-services)**
 * **[Guest Setup](#setup-guest-os)**
-* **[Attching PCI Devices](#attaching-pci-devices)**
+* **[Attaching PCI Devices](#attaching-pci-devices)**
 * **[Libvirt Hooks](#libvirt-hooks)**
+* **[Automation Script](#automation-script)**
 * **[Keyboard/Mouse Passthrough](#keyboardmouse-passthrough)**
 * **[Video Card Virtualisation Detection](#video-card-driver-virtualisation-detection)**
 * **[Audio Passthrough](#audio-passthrough)**
+* **[GPU Reset for AMD](#gpu-reset-for-amd)**
 * **[GPU vBIOS Patching](#vbios-patching)**
 
-### **Enable & Verify IOMMU**
-***BIOS Settings*** \
-Enable ***Intel VT-d*** or ***AMD-Vi*** in BIOS settings. If these options are not present, it is likely that your hardware does not support IOMMU.
+### Enable & Verify IOMMU
+**BIOS Settings**  
+Enable **Intel VT-d** or **AMD-Vi**. Disable **Resizable BAR** if issues (see [below](#resizable-bar)).
 
-Disable ***Resizable BAR Support*** in BIOS settings. 
-Cards that support Resizable BAR can cause problems with black screens following driver load if Resizable BAR is enabled in UEFI/BIOS. There doesn't seem to be a large performance penalty for disabling it, so turn it off for now until ReBAR support is available for KVM. 
-
-***Set the kernel paramater depending on your CPU.***
+**Kernel Parameter** (detect CPU: Intel/AMD via `/proc/cpuinfo`).
 
 <details>
-  <summary><b>GRUB</b></summary>
+<summary><b>GRUB</b></summary>
 
-***Edit GRUB configuration***
-| /etc/default/grub |
-| ----- |
-| `GRUB_CMDLINE_LINUX_DEFAULT="... intel_iommu=on iommu=pt ..."` |
-| OR |
-| `GRUB_CMDLINE_LINUX_DEFAULT="... amd_iommu=on iommu=pt ..."` |
+Edit `/etc/default/grub`:  
+`GRUB_CMDLINE_LINUX_DEFAULT="... intel_iommu=on iommu=pt ..."` or `amd_iommu=on`.  
 
-***Generate grub.cfg***
 ```sh
 grub-mkconfig -o /boot/grub/grub.cfg
 ```
 </details>
-<details>
-  <summary><b>Systemd Boot</b></summary>
 
-***Edit boot entry.***
-| /boot/loader/entries/*.conf |
-| ----- |
-| `options root=UUID=...intel_iommu=on iommu=pt..` |
-| OR |
-| `options root=UUID=...amd_iommu=on iommu=pt..` |
+<details>
+<summary><b>Systemd Boot</b></summary>
+
+Edit `/boot/loader/entries/*.conf`:  
+`options root=UUID=... intel_iommu=on iommu=pt` or `amd_iommu=on`.
 </details>
 
-Reboot your system for the changes to take effect.
-
-***To verify IOMMU, run the following command.***
+Reboot. Verify:  
 ```sh
 dmesg | grep IOMMU
 ```
-The output should include the message `Intel-IOMMU: enabled` for Intel CPUs or `AMD-Vi: AMD IOMMUv2 loaded and initialized` for AMD CPUs.
+Expected: `Intel-IOMMU: enabled` or `AMD-Vi: AMD IOMMUv2 loaded`.
 
-To view the IOMMU groups and attached devices, run the following script:
+IOMMU groups script:  
 ```sh
 #!/bin/bash
 shopt -s nullglob
@@ -66,552 +58,240 @@ for g in `find /sys/kernel/iommu_groups/* -maxdepth 0 -type d | sort -V`; do
     done;
 done;
 ```
+Pass all in GPU group. Use [ACS override](https://wiki.archlinux.org/title/PCI_passthrough_via_OVMF#Bypassing_the_IOMMU_groups_(ACS_override_patch)) to isolate.
 
-When using passthrough, it is necessary to pass every device in the group that includes your GPU. \
-You can avoid having to pass everything by using [ACS override patch](https://wiki.archlinux.org/title/PCI_passthrough_via_OVMF#Bypassing_the_IOMMU_groups_(ACS_override_patch)).
+### Resizable BAR
+Kernel 6.1+ supports ReBAR. Enable in BIOS for perf gain. For AMD, avoid Code 43 with udev rule:  
+`/etc/udev/rules.d/01-amd.rules`  
+```
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x1002", ATTR{device}=="0x73bf", ATTR{resource0_resize}="14"
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x1002", ATTR{device}=="0x73bf", ATTR{resource2_resize}="8"
+```
+Reload: `udevadm control --reload`. Set BAR2=8MB (value 3) if needed.
 
-### **Install required tools**
+### Install required tools
+Add vendor-reset for AMD reset bug.
+
 <details>
-  <summary><b>Gentoo Linux</b></summary>
+<summary><b>Gentoo Linux</b></summary>
 
-  ```sh
-  emerge -av qemu virt-manager libvirt ebtables dnsmasq
-  ```
+```sh
+emerge -av qemu virt-manager libvirt ebtables dnsmasq vendor-reset
+```
 </details>
 
 <details>
-  <summary><b>Arch Linux</b></summary>
+<summary><b>Arch Linux</b></summary>
 
-  ```sh
-  pacman -S qemu libvirt edk2-ovmf virt-manager dnsmasq ebtables
-  ```
+```sh
+pacman -S qemu libvirt edk2-ovmf virt-manager dnsmasq ebtables vendor-reset
+```
 </details>
 
 <details>
-  <summary><b>Fedora</b></summary>
+<summary><b>Fedora</b></summary>
 
-  ```sh
-  dnf install @virtualization
-  ```
+```sh
+dnf install @virtualization vendor-reset
+```
 </details>
 
 <details>
-  <summary><b>Ubuntu</b></summary>
+<summary><b>Ubuntu</b></summary>
 
-  ```sh
-  apt install qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients bridge-utils virt-manager ovmf
-  ```
+```sh
+apt install qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients bridge-utils virt-manager ovmf vendor-reset
+```
 </details>
 
-### **Enable required services**
+### Enable required services
 <details>
-  <summary><b>SystemD</b></summary>
+<summary><b>SystemD</b></summary>
 
-  ```sh
-  systemctl enable --now libvirtd
-  ```
+```sh
+systemctl enable --now libvirtd
+modprobe vendor-reset  # For AMD
+```
 </details>
 
 <details>
-  <summary><b>OpenRC</b></summary>
+<summary><b>OpenRC</b></summary>
 
-  ```sh
-  rc-update add libvirtd default
-  rc-service libvirtd start
-  ```
+```sh
+rc-update add libvirtd default
+rc-service libvirtd start
+```
 </details>
 
-Sometimes, you might need to start default network manually.
+Start default net:  
 ```sh
 virsh net-start default
 virsh net-autostart default
 ```
 
-### **Setup Guest OS**
-***NOTE: You should replace win10 with your VM's name where applicable*** \
-You should add your user to ***libvirt*** group to be able to run VM without root. And, ***input*** and ***kvm*** group for passing input devices.
+### Setup Guest OS
+Add user to groups:  
 ```sh
-usermod -aG kvm,input,libvirt username
+usermod -aG kvm,input,libvirt $USER
 ```
+Download [virtio](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso).  
+In virt-manager: Q35 chipset, UEFI firmware, host-passthrough CPU, virtio disk/NIC. Load virtio drivers during install. Remove ISO post-install.
 
-Download [virtio](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso) driver. \
-Launch ***virt-manager*** and create a new virtual machine. Select ***Customize before install*** on Final Step. \
-In ***Overview*** section, set ***Chipset*** to ***Q35***, and ***Firmware*** to ***UEFI*** \
-In ***CPUs*** section, set ***CPU model*** to ***host-passthrough***, and ***CPU Topology*** to whatever fits your system. \
-For ***SATA*** disk of VM, set ***Disk Bus*** to ***virtio***. \
-In ***NIC*** section, set ***Device Model*** to ***virtio*** \
-Add Hardware > CDROM: virtio-win.iso \
-Now, ***Begin Installation***. Windows can't detect the ***virtio disk***, so you need to ***Load Driver*** and select ***virtio-iso/amd64/win10*** when prompted. \
-After successful installation of Windows, install virtio drivers from virtio CDROM. You can then remove virtio iso.
+### Attaching PCI devices
+Remove Spice/QXL/ich*. Add PCI Host for GPU VGA/HDMI Audio.
 
-### **Attaching PCI devices**
-Remove Channel Spice, Display Spice, Video QXL, Sound ich* and other unnecessary devices. \
-Now, click on ***Add Hardware***, select ***PCI Devices*** and add the PCI Host devices for your GPU's VGA and HDMI Audio.
+### Libvirt Hooks
+Automate via hooks. For AMD 6000: Skip EFI framebuffer unbind/rebind; unload amdgpu after detach. For Plasma Wayland: Stop user services.
 
-### **Libvirt Hooks**
-Libvirt hooks automate the process of running specific tasks during VM state change. \
-More info at: [PassthroughPost](https://passthroughpo.st/simple-per-vm-libvirt-hooks-with-the-vfio-tools-hook-helper/)
-
-**Note**: Comment Unbind/rebind EFI framebuffer line from start and stop script if you're using AMD 6000 series cards (https://github.com/QaidVoid/Complete-Single-GPU-Passthrough/issues/9).
-Also, move the line to unload AMD kernal module below detaching devices from host. These might also apply to older AMD cards.
+See [PassthroughPost](https://passthroughpo.st/simple-per-vm-libvirt-hooks-with-the-vfio-tools-hook-helper/).
 
 <details>
-  <summary><b>Create Libvirt Hook</b></summary>
+<summary><b>Create Hook</b></summary>
 
-  ```sh
-  mkdir /etc/libvirt/hooks
-  touch /etc/libvirt/hooks/qemu
-  chmod +x /etc/libvirt/hooks/qemu
-  ```
-  <table>
-  <tr>
-  <th>
-    /etc/libvirt/hooks/qemu
-  </th>
-  </tr>
+```sh
+mkdir /etc/libvirt/hooks
+touch /etc/libvirt/hooks/qemu
+chmod +x /etc/libvirt/hooks/qemu
+```
 
-  <tr>
-  <td>
-
-  ```sh
-  #!/bin/bash
-
-GUEST_NAME="$1"
-HOOK_NAME="$2"
-STATE_NAME="$3"
-MISC="${@:4}"
-
+`/etc/libvirt/hooks/qemu`:  
+```sh
+#!/bin/bash
+GUEST_NAME="$1" HOOK_NAME="$2" STATE_NAME="$3" MISC="${@:4}"
 BASEDIR="$(dirname $0)"
-
 HOOKPATH="$BASEDIR/qemu.d/$GUEST_NAME/$HOOK_NAME/$STATE_NAME"
-set -e # If a script exits with an error, we should as well.
-
+set -e
 if [ -f "$HOOKPATH" ]; then
-  eval \""$HOOKPATH"\" "$@"
+  eval "\"$HOOKPATH\"" "$@"
 elif [ -d "$HOOKPATH" ]; then
   while read file; do
-    eval \""$file"\" "$@"
+    eval "\"$file\"" "$@"
   done <<< "$(find -L "$HOOKPATH" -maxdepth 1 -type f -executable -print;)"
 fi
-  ```
-
-  </td>
-  </tr>
-  </table>
+```
 </details>
 
-<details>
-  <summary><b>Create Start Script</b></summary>
-  
-  ```sh
-  mkdir -p /etc/libvirt/hooks/qemu.d/win10/prepare/begin
-  touch /etc/libvirt/hooks/qemu.d/win10/prepare/begin/start.sh
-  chmod +x /etc/libvirt/hooks/qemu.d/win10/prepare/begin/start.sh
-  ```
-**Note**: If you're on KDE Plasma (Wayland), you need to terminate user services alongside display-manager (https://github.com/QaidVoid/Complete-Single-GPU-Passthrough/issues/31).
+### Automation Script
+`vfio-setup.sh` automates for OS/GPU/DE/VM. Detects CPU/bootloader/PCI. Run as root: `./vfio-setup.sh --vm=win10 --gpu=nvidia --de=plasma --os=arch --amd6000=false`
 
-  <table>
-  <tr>
-  <th>
-    /etc/libvirt/hooks/qemu.d/win10/prepare/begin/start.sh
-  </th>
-  </tr>
+```sh
+#!/bin/bash
+set -e
 
-  <tr>
-  <td>
+# Defaults
+VM=${VM:-win10}
+GPU=${GPU:-nvidia}
+DE=${DE:-other}
+OS=${OS:-auto}
+AMD6000=false
+CPU=$(grep -i 'vendor_id' /proc/cpuinfo | head -1 | awk '{print $3}' | tr '[:upper:]' '[:lower:]')
+IOMMU_PARAM=$([ $CPU = "genuineintel" ] && echo "intel_iommu=on" || echo "amd_iommu=on")
 
-  ```sh
+# Detect OS
+if [ "$OS" = "auto" ]; then
+  if command -v pacman >/dev/null; then OS=arch
+  elif command -v dnf >/dev/null; then OS=fedora
+  elif command -v apt >/dev/null; then OS=ubuntu
+  elif command -v emerge >/dev/null; then OS=gentoo
+  else echo "Unknown OS"; exit 1; fi
+fi
+
+# Install packages
+case $OS in
+  arch) pacman -S --noconfirm qemu libvirt edk2-ovmf virt-manager dnsmasq ebtables vendor-reset ;;
+  fedora) dnf install -y @virtualization vendor-reset ;;
+  ubuntu) apt update && apt install -y qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients bridge-utils virt-manager ovmf vendor-reset ;;
+  gentoo) emerge -av qemu virt-manager libvirt ebtables dnsmasq vendor-reset ;;
+esac
+systemctl enable --now libvirtd
+modprobe vendor-reset
+
+# Kernel params
+if [ -f /etc/default/grub ]; then
+  sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\"/GRUB_CMDLINE_LINUX_DEFAULT=\"${IOMMU_PARAM} iommu=pt\"/" /etc/default/grub
+  grub-mkconfig -o /boot/grub/grub.cfg
+elif [ -d /boot/loader/entries ]; then
+  for conf in /boot/loader/entries/*.conf; do
+    sed -i "s/options root=.*/options root=... ${IOMMU_PARAM} iommu=pt/" "$conf"
+  done
+fi
+
+# Detect GPU PCI (VGA + Audio)
+GPU_PCI=$(lspci | grep -i vga | grep -i $GPU | head -1 | awk '{print $1}' | sed 's/://')
+AUDIO_PCI=$(lspci | grep -i audio | grep -A1 "$GPU_PCI" | tail -1 | awk '{print $1}' | sed 's/://')
+FULL_GPU="pci_0000_${GPU_PCI//:/_}"
+FULL_AUDIO="pci_0000_${AUDIO_PCI//:/_}"
+
+# If AMD6000, check device ID (e.g., 73bf for 6700XT)
+if [ "$GPU" = "amd" ] && lspci -nn | grep "$GPU_PCI" | grep -q "10de\|1002.*\(73a[0-9]\|73b[0-9]\|73c[0-9]\|73d[0-9]\|73e[0-9]\|73f[0-9]\)"; then AMD6000=true; fi
+
+# Hooks dir
+HOOKS_DIR="/etc/libvirt/hooks/qemu.d/${VM}/prepare/begin"
+mkdir -p "$HOOKS_DIR" "/etc/libvirt/hooks/qemu.d/${VM}/release/end"
+
+# Start hook
+cat > "$HOOKS_DIR/start.sh" << EOF
 #!/bin/bash
 set -x
-
-# Stop display manager
 systemctl stop display-manager
-# systemctl --user -M YOUR_USERNAME@ stop plasma*
-
-# Unbind VTconsoles: might not be needed
+if [ "$DE" = "plasma" ]; then
+  systemctl --user -M \$USER stop plasma*  # Wayland
+fi
 echo 0 > /sys/class/vtconsole/vtcon0/bind
 echo 0 > /sys/class/vtconsole/vtcon1/bind
-
-# Unbind EFI Framebuffer
-echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/unbind
-
-# Unload NVIDIA kernel modules
-modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia
-
-# Unload AMD kernel module
-# modprobe -r amdgpu
-
-# Detach GPU devices from host
-# Use your GPU and HDMI Audio PCI host device
-virsh nodedev-detach pci_0000_01_00_0
-virsh nodedev-detach pci_0000_01_00_1
-
-# Load vfio module
+$( [ "$AMD6000" = false ] && echo 'echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/unbind' || echo '#' )
+$( [ "$GPU" = "nvidia" ] && echo 'modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia' )
+$( [ "$GPU" = "amd" ] && echo '# modprobe -r amdgpu  # After detach' )
+virsh nodedev-detach $FULL_GPU
+virsh nodedev-detach $FULL_AUDIO
+$( [ "$GPU" = "amd" ] && echo 'modprobe -r amdgpu' )
 modprobe vfio-pci
-  ```
+EOF
+chmod +x "$HOOKS_DIR/start.sh"
 
-  </td>
-  </tr>
-  </table>
-</details>
-
-<details>
-  <summary><b>Create Stop Script</b></summary>
-
-  ```sh
-  mkdir -p /etc/libvirt/hooks/qemu.d/win10/release/end
-  touch /etc/libvirt/hooks/qemu.d/win10/release/end/stop.sh
-  chmod +x /etc/libvirt/hooks/qemu.d/win10/release/end/stop.sh
-  ```
-  <table>
-  <tr>
-  <th>
-    /etc/libvirt/hooks/qemu.d/win10/release/end/stop.sh
-  </th>
-  </tr>
-
-  <tr>
-  <td>
-
-  ```sh
+# Stop hook
+cat > "/etc/libvirt/hooks/qemu.d/${VM}/release/end/stop.sh" << EOF
 #!/bin/bash
 set -x
-
-# Attach GPU devices to host
-# Use your GPU and HDMI Audio PCI host device
-virsh nodedev-reattach pci_0000_01_00_0
-virsh nodedev-reattach pci_0000_01_00_1
-
-# Unload vfio module
+virsh nodedev-reattach $FULL_GPU
+virsh nodedev-reattach $FULL_AUDIO
 modprobe -r vfio-pci
-
-# Load AMD kernel module
-#modprobe amdgpu
-
-# Rebind framebuffer to host
-echo "efi-framebuffer.0" > /sys/bus/platform/drivers/efi-framebuffer/bind
-
-# Load NVIDIA kernel modules
-modprobe nvidia_drm
-modprobe nvidia_modeset
-modprobe nvidia_uvm
-modprobe nvidia
-
-# Bind VTconsoles: might not be needed
+$( [ "$GPU" = "amd" ] && echo 'modprobe amdgpu' )
+$( [ "$GPU" = "nvidia" ] && echo 'modprobe nvidia_drm nvidia_modeset nvidia_uvm nvidia' )
+$( [ "$AMD6000" = false ] && echo 'echo "efi-framebuffer.0" > /sys/bus/platform/drivers/efi-framebuffer/bind' || echo '#' )
 echo 1 > /sys/class/vtconsole/vtcon0/bind
 echo 1 > /sys/class/vtconsole/vtcon1/bind
-
-# Restart Display Manager
 systemctl start display-manager
+if [ "$DE" = "plasma" ]; then
+  systemctl --user -M \$USER start plasma*
+fi
+EOF
+chmod +x "/etc/libvirt/hooks/qemu.d/${VM}/release/end/stop.sh"
+
+echo "Setup complete. Reboot. Edit VM in virt-manager."
 ```
 
-  </td>
-  </tr>
-  </table>
-</details>
+### Keyboard/Mouse Passthrough
+USB Host or Evdev. For Evdev: Edit VM XML, add qemu:commandline for /dev/input/by-id/*event-kbd/mouse. Update /etc/libvirt/qemu.conf cgroup_acl. Use virtio input.
 
-### **Keyboard/Mouse Passthrough**
-In order to be able to use keyboard/mouse in the VM, you can either passthrough the USB Host device or use Evdev passthrough.
+### Video Card Driver Virtualisation Detection
+Spoof Hyper-V: `<vendor_id state='on' value='whatever'/>`. Hide KVM for NVIDIA: `<kvm><hidden state='on'/></kvm>`.
 
-Using USB Host Device is simple, \
-***Add Hardware*** > ***USB Host Device***, add your keyboard and mouse device.
+### Audio Passthrough
+PipeWire/JACK or PulseAudio. See original for XML.
 
-For Evdev passthrough, follow these steps: \
-Modify libvirt configuration of your VM. \
-**Note**: Save only after adding keyboard and mouse devices or the changes gets lost. \
-Change first line to:
+### GPU Reset for AMD
+Load `vendor-reset` module for RX 6000 reset bug (Code 43).
 
-<table>
-<tr>
-<th>
-virsh edit win10
-</th>
-</tr>
+### vBIOS Patching
+Dump: `echo 1 | sudo tee /sys/bus/pci/devices/0000:01:00.0/rom; sudo cat ... > vbios.rom; echo 0 | sudo tee ...`  
+Trim header in hex editor (remove before 0x55 after "VIDEO"). Add to hostdev: `<rom file='/path/patched.rom'/>`.
 
-<tr>
-<td>
-
-```xml
-<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
-```
-
-</td>
-</tr>
-</table>
-
-Find your keyboard and mouse devices in ***/dev/input/by-id***. You'd generally use the devices ending with ***event-kbd*** and ***event-mouse***. And the devices in your configuration right before closing ***`</domain>`*** tag. \
-Replace ***MOUSE_NAME*** and ***KEYBOARD_NAME*** with your device id.
-
-<table>
-<tr>
-<th>
-virsh edit win10
-</th>
-</tr>
-
-<tr>
-<td>
-
-```xml
-...
-  <qemu:commandline>
-    <qemu:arg value='-object'/>
-    <qemu:arg value='input-linux,id=mouse1,evdev=/dev/input/by-id/MOUSE_NAME'/>
-    <qemu:arg value='-object'/>
-    <qemu:arg value='input-linux,id=kbd1,evdev=/dev/input/by-id/KEYBOARD_NAME,grab_all=on,repeat=on'/>
-  </qemu:commandline>
-</domain>
-```
-
-</td>
-</tr>
-</table>
-
-You need to include these devices in your qemu config.
-<table>
-<tr>
-<th>
-/etc/libvirt/qemu.conf
-</th>
-</tr>
-
-<tr>
-<td>
-
-```sh
-...
-user = "YOUR_USERNAME"
-group = "kvm"
-...
-cgroup_device_acl = [
-    "/dev/input/by-id/KEYBOARD_NAME",
-    "/dev/input/by-id/MOUSE_NAME",
-    "/dev/null", "/dev/full", "/dev/zero",
-    "/dev/random", "/dev/urandom",
-    "/dev/ptmx", "/dev/kvm", "/dev/kqemu",
-    "/dev/rtc","/dev/hpet", "/dev/sev"
-]
-...
-```
-
-</td>
-</tr>
-</table>
-
-Also, switch from PS/2 devices to virtio devices. Add the devices inside ***`<devices>`*** block
-<table>
-<tr>
-<th>
-virsh edit win10
-</th>
-</tr>
-
-<tr>
-<td>
-
-```xml
-...
-<devices>
-  ...
-  <input type='mouse' bus='virtio'/>
-  <input type='keyboard' bus='virtio'/>
-  ...
-</devices>
-...
-```
-
-</td>
-</tr>
-</table>
-
-### **Audio Passthrough**
-VM's audio can be routed to the host using ***Pipewire*** or ***Pulseaudio***. \
-You can also use [Scream](https://wiki.archlinux.org/index.php/PCI_passthrough_via_OVMF#Passing_VM_audio_to_host_via_Scream) instead.
-
-<details>
-    <summary><b>Pipewire</b></summary>
-
-From [ArchWiki](https://wiki.archlinux.org/title/PCI_passthrough_via_OVMF#Passing_audio_from_virtual_machine_to_host_via_JACK_and_PipeWire)
-
-You need to have Pipewire with JACK support.
-
-***Note***: You may use [Carla](https://kx.studio//Applications:Carla) to figure out appropriate input/output. Replace `1000` with your current user id.
-<table>
-<tr>
-<th>
-virsh edit win10
-</th>
-</tr>
-
-<tr>
-<td>
-
-```xml
-...
-  <devices>
-    ...
-    <audio id="1" type="jack">
-      <input clientName="win10" connectPorts="your-input"/>
-      <output clientName="win10" connectPorts="your-output"/>
-    </audio>
-  </devices>
-  <qemu:commandline>
-    <qemu:env name="PIPEWIRE_RUNTIME_DIR" value="/run/user/1000"/>
-    <qemu:env name="PIPEWIRE_LATENCY" value="512/48000"/>
-  </qemu:commandline>
-</domain>
-```
-
-</td>
-</tr>
-</table>
-</details>
-
-<details>
-    <summary><b>Pulseaudio</b></summary>
-
-***Note***: Replace `1000` with your current user id.
-
-<table>
-<tr>
-<th>
-virsh edit win10
-</th>
-</tr>
-
-<tr>
-<td>
-
-```xml
-...
-  <qemu:commandline>
-    ...
-    <qemu:arg value="-device"/>
-    <qemu:arg value="ich9-intel-hda,bus=pcie.0,addr=0x1b"/>
-    <qemu:arg value="-device"/>
-    <qemu:arg value="hda-micro,audiodev=hda"/>
-    <qemu:arg value="-audiodev"/>
-    <qemu:arg value="pa,id=hda,server=/run/user/1000/pulse/native"/>
-  </qemu:commandline>
-</domain>
-```
-
-</td>
-</tr>
-</table>
-</details>
-
-
-### **Video card driver virtualisation detection**
-Video Card drivers refuse to run in Virtual Machine, so you need to spoof Hyper-V Vendor ID.
-<table>
-<tr>
-<th>
-virsh edit win10
-</th>
-</tr>
-
-<tr>
-<td>
-
-```xml
-...
-<features>
-  ...
-  <hyperv>
-    ...
-    <vendor_id state='on' value='whatever'/>
-    ...
-  </hyperv>
-  ...
-</features>
-...
-```
-
-</td>
-</tr>
-</table>
-
-NVIDIA guest drivers also require hiding the KVM CPU leaf:
-<table>
-<tr>
-<th>
-virsh edit win10
-</th>
-</tr>
-
-<tr>
-<td>
-
-```xml
-...
-<features>
-  ...
-  <kvm>
-    <hidden state='on'/>
-  </kvm>
-  ...
-</features>
-...
-```
-
-</td>
-</tr>
-</table>
-
-### **vBIOS Patching**
-***NOTE: You are only making changes on dumped ROM file. Your hardware is safe.*** \
-While most of the GPU can be passed with stock vBIOS, some GPU requires vBIOS patching to passthrough. \
-In order to patch vBIOS, you need to first dump the GPU vBIOS from your system. \
-If you have Windows installed, you can use [GPU-Z](https://www.techpowerup.com/gpuz) to dump vBIOS. \
-To dump vBIOS on Linux, you can use following command (replace PCI id with yours):
-```sh
-echo 1 > /sys/bus/pci/devices/0000:01:00.0/rom
-cat /sys/bus/pci/devices/0000:01:00.0/rom > path/to/dump/vbios.rom
-echo 0 > /sys/bus/pci/devices/0000:01:00.0/rom
-```
-If you're not in root shell, you should use the above commands with sudo as:
-```sh
-echo 1 | sudo tee /sys/bus/pci/devices/0000:01:00.0/rom
-sudo cat /sys/bus/pci/devices/0000:01:00.0/rom > path/to/dump/vbios.rom
-echo 0 | sudo tee /sys/bus/pci/devices/0000:01:00.0/rom
-```
-To patch vBIOS, you need to use Hex Editor (eg., [Okteta](https://utils.kde.org/projects/okteta)) and trim unnecessary header. \
-For NVIDIA GPU, using hex editor, search string “VIDEO”, and remove everything before HEX value 55. \
-I'm not sure about AMD, but the process should be similar.
-
-To use patched vBIOS, edit VM's configuration to include patched vBIOS inside ***hostdev*** block of VGA
-
-  <table>
-  <tr>
-  <th>
-  virsh edit win10
-  </th>
-  </tr>
-
-  <tr>
-  <td>
-
-  ```xml
-  ...
-  <hostdev mode='subsystem' type='pci' managed='yes'>
-    <source>
-      ...
-    </source>
-    <rom file='/home/me/patched.rom'/>
-    ...
-  </hostdev>
-  ...
-  ```
-
-  </td>
-  </tr>
-  </table>
-
-### **See Also**
-> [Single GPU Passthrough Troubleshooting](https://docs.google.com/document/d/17Wh9_5HPqAx8HHk-p2bGlR0E-65TplkG18jvM98I7V8)<br/>
-> [Single GPU Passthrough by joeknock90](https://github.com/joeknock90/Single-GPU-Passthrough)<br/>
-> [Single GPU Passthrough by YuriAlek](https://gitlab.com/YuriAlek/vfio)<br/>
-> [Single GPU Passthrough by wabulu](https://github.com/wabulu/Single-GPU-passthrough-amd-nvidia)<br/>
-> [ArchLinux PCI Passthrough](https://wiki.archlinux.org/index.php/PCI_passthrough_via_OVMF)<br/>
-> [Gentoo GPU Passthrough](https://wiki.gentoo.org/wiki/GPU_passthrough_with_libvirt_qemu_kvm)<br/>
+### See Also
+[Single GPU Passthrough Troubleshooting](https://docs.google.com/document/d/17Wh9_5HPqAx8HHk-p2bGlR0E-65TplkG18jvM98I7V8)<br/>
+[joeknock90](https://github.com/joeknock90/Single-GPU-Passthrough)<br/>
+[YuriAlek](https://gitlab.com/YuriAlek/vfio)<br/>
+[wabulu](https://github.com/wabulu/Single-GPU-passthrough-amd-nvidia)<br/>
+[ArchWiki](https://wiki.archlinux.org/title/PCI_passthrough_via_OVMF)<br/>
+[Gentoo](https://wiki.gentoo.org/wiki/GPU_passthrough_with_libvirt_qemu_kvm)<br/>
+[Muxless 2025](https://github.com/ArshamEbr/Muxless-GPU-Passthrough)
